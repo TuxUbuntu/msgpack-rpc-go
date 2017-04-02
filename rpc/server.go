@@ -35,88 +35,9 @@ func (self *Server) Run() *Server {
 					conn.Close()
 					break
 				}
-				go (func() {
-				NextRequest:
-					for {
-						data, _, err := msgpack.UnpackReflected(conn)
-						if err == io.EOF {
-							break
-						} else if err != nil {
-							self.log.Println(err)
-							break
-						}
-						msgId, funcName, _arguments, xerr := HandleRPCRequest(data)
-						if xerr != nil {
-							self.log.Println(xerr)
-							continue NextRequest
-						}
-						f, xerr := self.resolver.Resolve(funcName, _arguments)
-						if xerr != nil {
-							self.log.Println(xerr)
-							SendErrorResponseMessage(conn, msgId, xerr.Error())
-							continue NextRequest
-						}
-						funcType := f.Type()
-						if funcType.NumIn() != len(_arguments) {
-							msg := fmt.Sprintf("The number of the given arguments (%d) doesn't match the arity (%d)", len(_arguments), funcType.NumIn())
-							self.log.Println(msg)
-							SendErrorResponseMessage(conn, msgId, msg)
-							continue NextRequest
-						}
-						if funcType.NumOut() != 1 && funcType.NumOut() != 2 {
-							self.log.Println("The number of return values must be 1 or 2")
-							SendErrorResponseMessage(conn, msgId, "Internal server error")
-							continue NextRequest
-						}
-
-						arguments := make([]reflect.Value, funcType.NumIn())
-						for i, v := range _arguments {
-							ft := funcType.In(i)
-							vt := v.Type()
-							if vt.AssignableTo(ft) {
-								arguments[i] = v
-							} else if pv, ok := integerPromote(ft, v); ok {
-								arguments[i] = pv
-							} else if self.autoCoercing && ft != nil && ft.Kind() == reflect.String && (v.Type().Kind() == reflect.Array || v.Type().Kind() == reflect.Slice) && v.Type().Elem().Kind() == reflect.Uint8 {
-								arguments[i] = reflect.ValueOf(string(v.Interface().([]byte)))
-							} else {
-								msg := fmt.Sprintf("The type of argument #%d doesn't match (%s expected, got %s)", i, ft.String(), vt.String())
-								self.log.Println(msg)
-								SendErrorResponseMessage(conn, msgId, msg)
-								continue NextRequest
-							}
-						}
-
-						retvals := f.Call(arguments)
-						if funcType.NumOut() == 1 {
-							SendResponseMessage(conn, msgId, retvals[0])
-							continue NextRequest
-						}
-						var errMsg fmt.Stringer = nil
-						_errMsg := retvals[1].Interface()
-						if _errMsg != nil {
-							var ok bool
-							errMsg, ok = _errMsg.(fmt.Stringer)
-							if !ok {
-								self.log.Println("The second argument must have an interface { String() string }")
-								SendErrorResponseMessage(conn, msgId, "Internal server error")
-								continue NextRequest
-							}
-						}
-						if errMsg != nil {
-							SendErrorResponseMessage(conn, msgId, errMsg.String())
-							continue NextRequest
-						}
-						if self.autoCoercing {
-							_retval := retvals[0]
-							if _retval.Kind() == reflect.String {
-								retvals[0] = reflect.ValueOf([]byte(_retval.String()))
-							}
-						}
-						SendResponseMessage(conn, msgId, retvals[0])
-					}
-					conn.Close()
-				})()
+				session := NewSession(conn, self.autoCoercing)
+				go session.Run(self.resolver)
+				// self.log.Println(msg)
 			}
 		})(listener)
 	}
@@ -127,6 +48,24 @@ func (self *Server) Run() *Server {
 	}
 	return self
 }
+
+// Lets the server quit the event loop
+func (self *Server) Stop() *Server {
+	if self.lchan != nil {
+		lchan := self.lchan
+		self.lchan = nil
+		lchan <- 1
+	}
+	return self
+}
+
+// Listenes on the specified transport.  A single server can listen on the
+// multiple ports.
+func (self *Server) Listen(listener net.Listener) *Server {
+	self.listeners = append(self.listeners, listener)
+	return self
+}
+
 
 // integerPromote determines if we can promote v to dType, and if so, return the promoted value.
 // This is needed because msgpack always encodes values as the minimum sized int that can hold them.
@@ -182,24 +121,6 @@ func isUintType(t kinder) bool {
 		t.Kind() == reflect.Uint32 ||
 		t.Kind() == reflect.Uint64
 }
-
-// Lets the server quit the event loop
-func (self *Server) Stop() *Server {
-	if self.lchan != nil {
-		lchan := self.lchan
-		self.lchan = nil
-		lchan <- 1
-	}
-	return self
-}
-
-// Listenes on the specified transport.  A single server can listen on the
-// multiple ports.
-func (self *Server) Listen(listener net.Listener) *Server {
-	self.listeners = append(self.listeners, listener)
-	return self
-}
-
 // Creates a new Server instance. raw bytesc are automatically converted into
 // strings if autoCoercing is enabled.
 func NewServer(resolver FunctionResolver, autoCoercing bool, _log *log.Logger) *Server {
@@ -223,23 +144,28 @@ func HandleRPCRequest(req reflect.Value) (int, string, []reflect.Value, error) {
 		msgType := _req[0]
 		typeOk := msgType.Kind() == reflect.Int || msgType.Kind() == reflect.Int8 || msgType.Kind() == reflect.Int16 || msgType.Kind() == reflect.Int32 || msgType.Kind() == reflect.Int64
 		if !typeOk {
+			fmt.Println("error: typeOk")
 			break;
 		}
 		msgId := _req[1]
 		idOk := msgId.Kind() == reflect.Int || msgId.Kind() == reflect.Int8 || msgId.Kind() == reflect.Int16 || msgId.Kind() == reflect.Int32 || msgId.Kind() == reflect.Int64
 		if !idOk {
+			fmt.Println("error: idOk")
 			break;
 		}
 		_funcName := _req[2]
 		funcOk := _funcName.Kind() == reflect.Array || _funcName.Kind() == reflect.Slice
 		if !funcOk {
+			fmt.Println("error: funcOk", _funcName)
 			break;
 		}
 		funcName, ok := _funcName.Interface().([]uint8)
 		if !ok {
+			fmt.Println("error: funcName")
 			break;
 		}
 		if msgType.Int() != REQUEST {
+			fmt.Println("error: msgType", msgType.Int())
 			break;
 		}
 		_arguments := _req[3]
@@ -258,7 +184,7 @@ func HandleRPCRequest(req reflect.Value) (int, string, []reflect.Value, error) {
 		}
 		return int(msgId.Int()), string(funcName), arguments, nil
 	}
-	return 0, "", nil, errors.New("Invalid message format")
+	return 0, "", nil, errors.New("Invalid message format server")
 }
 
 // This is a low-level function that is not supposed to be called directly

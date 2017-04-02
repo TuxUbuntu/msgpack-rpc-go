@@ -93,6 +93,106 @@ func (self *Session) Send(funcName string, arguments ...interface{}) (reflect.Va
 	return self.SendV(funcName, arguments)
 }
 
+// Listen resolver
+func (self *Session) Run(resolver FunctionResolver) {
+	sessionVal := reflect.ValueOf(self)
+	NextRequest:
+	for {
+		data, _, err := msgpack.UnpackReflected(self.conn)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			fmt.Println(err)
+			break
+		}
+		msgId, funcName, _arguments, xerr := HandleRPCRequest(data)
+		if xerr != nil {
+			fmt.Println(xerr)
+			continue NextRequest
+		}
+		f, xerr := resolver.Resolve(funcName, _arguments)
+		if xerr != nil {
+			fmt.Println(xerr)
+			SendErrorResponseMessage(self.conn, msgId, xerr.Error())
+			continue NextRequest
+		}
+		funcType := f.Type()
+		gotSession := sessionVal.Type().AssignableTo(funcType.In(0))
+		numArgs := funcType.NumIn()
+		if gotSession {
+			numArgs = numArgs - 1
+		}
+		if numArgs != len(_arguments) {
+			msg := fmt.Sprintf("The number of the given arguments (%d) doesn't match the arity (%d)", len(_arguments), numArgs)
+			fmt.Println(msg)
+			SendErrorResponseMessage(self.conn, msgId, msg)
+			continue NextRequest
+		}
+
+		if funcType.NumOut() != 1 && funcType.NumOut() != 2 {
+			fmt.Println("The number of return values must be 1 or 2")
+			SendErrorResponseMessage(self.conn, msgId, "Internal server error")
+			continue NextRequest
+		}
+
+		arguments := make([]reflect.Value, numArgs)
+		for i, v := range _arguments {
+			ft := funcType.In(i)
+			if gotSession {
+				ft = funcType.In(i+1)
+			}
+			vt := v.Type()
+			if vt.AssignableTo(ft) {
+				arguments[i] = v
+			} else if pv, ok := integerPromote(ft, v); ok {
+				arguments[i] = pv
+			} else if self.autoCoercing && ft != nil && ft.Kind() == reflect.String && (v.Type().Kind() == reflect.Array || v.Type().Kind() == reflect.Slice) && v.Type().Elem().Kind() == reflect.Uint8 {
+				arguments[i] = reflect.ValueOf(string(v.Interface().([]byte)))
+			} else {
+				msg := fmt.Sprintf("The type of argument #%d doesn't match (%s expected, got %s)", i, ft.String(), vt.String())
+				fmt.Println(msg)
+				SendErrorResponseMessage(self.conn, msgId, msg)
+				continue NextRequest
+			}
+		}
+
+		var retvals []reflect.Value
+		if gotSession {
+			args := append([]reflect.Value{sessionVal}, arguments...)
+			retvals = f.Call(args)
+		} else {
+			retvals = f.Call(arguments)
+		}
+		if funcType.NumOut() == 1 {
+			SendResponseMessage(self.conn, msgId, retvals[0])
+			continue NextRequest
+		}
+		var errMsg fmt.Stringer = nil
+		_errMsg := retvals[1].Interface()
+		if _errMsg != nil {
+			var ok bool
+			errMsg, ok = _errMsg.(fmt.Stringer)
+			if !ok {
+				fmt.Println("The second argument must have an interface { String() string }")
+				SendErrorResponseMessage(self.conn, msgId, "Internal server error")
+				continue NextRequest
+			}
+		}
+		if errMsg != nil {
+			SendErrorResponseMessage(self.conn, msgId, errMsg.String())
+			continue NextRequest
+		}
+		if self.autoCoercing {
+			_retval := retvals[0]
+			if _retval.Kind() == reflect.String {
+				retvals[0] = reflect.ValueOf([]byte(_retval.String()))
+			}
+		}
+		SendResponseMessage(self.conn, msgId, retvals[0])
+	}
+	self.conn.Close()
+}
+
 // Creates a new session with the specified connection.  Strings are
 // automatically converted into raw bytes if autoCoercing is
 // enabled.
@@ -130,7 +230,7 @@ func ReceiveResponse(reader io.Reader) (int, reflect.Value, error) {
 	if err != nil {
 		return 0, reflect.Value{}, errors.New("Error occurred while receiving a response")
 	}
-
+	// fmt.Println(data)
 	msgId, result, err := HandleRPCResponse(data)
 	if err != nil {
 		return 0, reflect.Value{}, err
@@ -176,5 +276,6 @@ func HandleRPCResponse(req reflect.Value) (int, reflect.Value, error) {
 		}
 		return int(msgId.Int()), _req[3], nil
 	}
-	return 0, reflect.Value{}, errors.New("Invalid message format")
+	return 0, reflect.Value{}, errors.New("Invalid message format client")
 }
+
